@@ -17,6 +17,8 @@ from deepks.utils import is_xyz, load_sys_paths
 from deepks.utils import load_yaml, load_array
 from deepks.utils import get_sys_name, get_with_prefix
 
+DEFAULT_UNIT = "Bohr"
+
 DEFAULT_FNAMES = {"e_tot", "e_base", "dm_eig", "conv"}
 
 DEFAULT_HF_ARGS = {
@@ -25,13 +27,13 @@ DEFAULT_HF_ARGS = {
 
 DEFAULT_SCF_ARGS = {
     "conv_tol": 1e-7,
-    "level_shift": 0.1,
-    "diis_space": 20
+    # "level_shift": 0.1,
+    # "diis_space": 20
 }
 
-MOL_ATTRIBUTE = {"charge"} # basis, symmetry, and more
+MOL_ATTRIBUTE = {"charge", "basis", "unit"} # other molecule properties
 
-def solve_mol(mol, model, fields,
+def solve_mol(mol, model, fields, labels=None,
               proj_basis=None, penalties=None, device=None,
               chkfile=None, verbose=0,
               **scf_args):
@@ -43,8 +45,10 @@ def solve_mol(mol, model, fields,
                 proj_basis=proj_basis, 
                 penalties=penalties, 
                 device=device)
-    cf.set(chkfile=chkfile)
+    cf.set(chkfile=chkfile, verbose=verbose)
+    grid_args = scf_args.pop("grids", {})
     cf.set(**scf_args)
+    cf.grids.set(**grid_args)
     cf.kernel()
 
     natom = mol.natm
@@ -53,12 +57,16 @@ def solve_mol(mol, model, fields,
     meta = np.array([natom, nao, nproj])
 
     res = {}
+    if labels is None:
+        labels = {}
     for fd in fields["scf"]:
-        res[fd.name] = fd.calc(cf)
+        fls = {k:labels[k] for k in fd.required_labels}
+        res[fd.name] = fd.calc(cf, **fls)
     if fields["grad"]:
         gd = cf.nuc_grad_method().run()
         for fd in fields["grad"]:
-            res[fd.name] = fd.calc(gd)
+            fls = {k:labels[k] for k in fd.required_labels}
+            res[fd.name] = fd.calc(gd, **fls)
     
     tac = time.time()
     if verbose:
@@ -79,7 +87,7 @@ def get_required_labels(fields=None, penalty_dicts=None):
 def system_iter(path, labels=None):
     """
     return an iterator that gives atoms and required labels each time
-    path: either an xyz file, or a folder contains (atom.npy | (coord.npy @ type.raw))
+    path: either an xyz file, or a folder contains (atom.npy | (coord.npy & type.raw))
     labels: a set contains required label names, will be load by $base[.|/]$label.npy
     $base will be the basename of the xyz file (followed by .) or the folder (followed by /)
     """
@@ -94,6 +102,8 @@ def system_iter(path, labels=None):
     if is_xyz(path):
         atom = path
         attr_dict = {at: load_array(attr_paths[at]) for at in attrs}
+        if "unit" not in attr_dict:
+            attr_dict["unit"] = "Angstrom"
         label_dict = {lb: load_array(label_paths[lb]) for lb in labels}
         yield atom, attr_dict, label_dict
         return
@@ -126,13 +136,15 @@ def system_iter(path, labels=None):
         return
 
 
-def build_mol(atom, basis='ccpvdz', verbose=0, **kwargs):
+def build_mol(atom, basis='ccpvdz', unit=DEFAULT_UNIT, verbose=0, **kwargs):
     # build a molecule using given atom input
     # set the default basis to cc-pVDZ and use input unit 'Ang"
     mol = gto.Mole()
     # change minimum max memory to 16G
     # mol.max_memory = max(16000, mol.max_memory) 
-    mol.unit = "Ang"
+    if isinstance(unit, np.ndarray):
+        unit = unit.tolist()
+    mol.unit = unit
     mol.atom = atom
     mol.basis = basis
     mol.verbose = verbose
@@ -149,14 +161,6 @@ def build_penalty(pnt_dict, label_dict={}):
     label_names = pnt_dict.pop("required_labels", PenaltyClass.required_labels)
     label_arrays = [label_dict[lb] for lb in check_list(label_names)]
     return PenaltyClass(*label_arrays, **pnt_dict)
-
-
-def make_labels(res, lbl, label_fields):
-    if isinstance(label_fields, dict):
-        label_fields = label_fields["label"]
-    for fd in label_fields:
-        res[fd.name] = fd.calc(res, lbl)
-    return res
 
 
 def collect_fields(fields, meta, res_list):
@@ -207,7 +211,7 @@ def main(systems, model_file="model.pth", basis='ccpvdz',
     scf_args = {**default_scf_args, **scf_args}
     fields = select_fields(dump_fields)
     # check label names from label fields and penalties
-    label_names = get_required_labels(fields["label"], penalty_terms)
+    label_names = get_required_labels(fields["scf"]+fields["grad"], penalty_terms)
 
     if verbose:
         print(f"starting calculation with OMP threads: {lib.num_threads()}",
@@ -228,10 +232,9 @@ def main(systems, model_file="model.pth", basis='ccpvdz',
             mol = build_mol(**mol_input)
             penalties = [build_penalty(pd, labels) for pd in penalty_terms]
             try:
-                meta, result = solve_mol(mol, model, fields,
+                meta, result = solve_mol(mol, model, fields, labels,
                                          proj_basis=proj_basis, penalties=penalties,
                                          device=device, verbose=verbose, **scf_args)
-                result = make_labels(result, labels, fields["label"])
             except Exception as e:
                 print(fl, 'failed! error:', e, file=sys.stderr)
                 # continue

@@ -8,10 +8,13 @@ nohup python -u -m deepks iterate args.yaml >> log.iter 2> err.iter &
 echo $! > PID
 ```
 that runs the iterative learning procedure in background and record its PID in the designated file.
+Note that we use `python -u -m deepks` to turn off python's output buffer. You can also use `deepks` or `dks` directly if you have installed it properly. 
+
+Here we are using Slurm to schedule jobs. If Slurm is not available, please execute [`./run_shell.sh`](./run_shell.sh) to run on local machine. In the following section we provide a work through on how to write the arguments for deepks input in the [`args.yaml`](./args.yaml). You can also take a look at it for explanation on each specific parameters.
 
 ## System preparation
 
-We use randomly generated water monomers, dimers and trimers as training datasets. Each dataset contains 100 near equilibrium configurations. We also include 50 tetramers as a validation dataset. We use energy and force as labels. The reference values are given by CCSD calculation with cc-pVDZ basis. The system configurations and corresponding labels are grouped into different folders by the number of atoms, follow the convention described in [another example](../water_single/README.md). The path to the folders can be specified in the config file as follows:
+We use randomly generated water monomers, dimers and trimers as training datasets. Each dataset contains 100 near equilibrium configurations. We also include 50 tetramers as a validation dataset. We use energy and force as labels. The reference values are given by CCSD calculation with cc-pVDZ basis. The system configurations and corresponding labels are grouped into different folders by the number of atoms, follow the convention described in [another example](../water_single/README.md). Note that the default length unit in deepks is Bohr. The systems we provided here are in Angstrom, so we add a `unit.raw` file containing "Angstrom" in each system folder to specify the unit different from default. The path to the folders can be specified in the config file as follows:
 ```yaml
 systems_train: # can also be files that containing system paths
   - ./systems/train.n[1-3]
@@ -43,15 +46,15 @@ dump_fields: [conv, e_tot, dm_eig, l_e_delta, f_tot, grad_vx, l_f_delta]
 ```
 Due to the complexity of the neural network functional, we use looser (but still accurate enough) convergence criteria in `scf_args`, with `conv_tol` to be 1e-6.
 
-The training parameters are provided in the `train_input` key, similar to `init_train`. But since we are restarting from the existing model, no `model_args` is needed, and the preprocessing procedure can be turned off. In addition, we add `with_force: true` in `data_args` and `force_factor: 1` in `train_args` to enable using forces in training. The total number of training epochs is also reduced to 5000. The learning rate starts as 1e-4 and decays by a factor of 0.5 for every 1000 steps.
+The training parameters are provided in the `train_input` key, similar to `init_train`. But since we are restarting from the existing model, no `model_args` is needed, and the preprocessing procedure can be turned off. In addition, we add `extra_label: true` in `data_args` and `force_factor: 1` in `train_args` to enable using forces in training. The total number of training epochs is also reduced to 5000. The learning rate starts as 1e-4 and decays by a factor of 0.5 for every 1000 steps.
 
 ## Machine settings
 
-How the SCF and training tasks are executed is specified in `scf_machine` and `train_machine`, respectively. Currently, both the initial and the following iterations share the same machine settings. In this example, we run our tasks on local computing cluster with Slurm as the job schedular. The platform to run the tasks is specified under the `dispatcher` key, and the computing resources assigned to each task is specified under `resources`. The setting of this part differs on every computing platform. We provide here our `training_machine` settings as an example:
+How the SCF and training tasks are executed is specified in `scf_machine` and `train_machine`, respectively. Currently, both the initial and the following iterations share the same machine settings. In this example, we run our tasks on local computing cluster with Slurm as the job scheduler. The platform to run the tasks is specified under the `dispatcher` key, and the computing resources assigned to each task is specified under `resources`. The setting of this part differs on every computing platform. We provide here our `training_machine` settings as an example:
 ```yaml
 dispatcher: 
   context: local
-  batch: slurm
+  batch: slurm # set to "shell" to run on local machine
   remote_profile: null # unnecessary in local context
 resources:
   time_limit: '24:00:00'
@@ -62,12 +65,14 @@ python: "python" # use python in path
 ```
 where we assign four CPU cores and one GPU to the training task, and set its time limit to be 24 hours and memory limit to be 8GB. The detailed settings available for `dispatcher` and `resources` can be found in the document of DP-GEN software, with a slightly different interface.
 
+In case there's no Slurm scheduler system, DeePKS-kit can also be run on a local machine with vanilla shell scripts, simply by setting `batch: shell`. Please check [`shell.yaml`](./shell.yaml) for an example. In that case, `resources` will be ignored and all available resources on the machine will be used. Support for more scheduler systems will also be implemented in the future.
+
 ## Testing the model
 
 During each iteration of the learning procedure, a brief summary on the accuracy of the SCF calculation can be found in `iter.xx/00.scf/log.data`. Average energy and force (if applicable) errors are shown for both training and validation dataset. The results of the SCF calculations is also stored in `iter.xx/00.scf/data_train` and `iter.xx/00.scf/data_test` grouped by training and testing systems.
 
 After we finished our 10 iterations, the resulted DeePKS model can be found at `iter.09/01.train/model.pth`. The model can be used in either a python script creating the extended PySCF class, or directly the `deepks scf` command. As a testing example, we run the SCF calculation using the learned DeePKS model on the simultaneous six proton transfer path of a water hexamer ring. 
-The command can be found in [test.sh](./test.sh).
+The command can be found in [`test.sh`](./test.sh).
 The results of each configuration during the proton transfer are grouped in the `test_result` folder. 
 
 We can see that all the predicted energy falls within the chemical accuracy range of the reference value given by the CCSD calculation. We note that none of the training dataset includes dissociated configurations in the proton transfer case. The DeePKS model trained on up to three water molecules exhibits good transferability, even in the bond breaking case.

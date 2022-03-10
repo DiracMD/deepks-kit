@@ -2,10 +2,12 @@ import abc
 import time
 import torch
 import numpy as np
+from torch import nn
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import gto
 from pyscf import scf, dft
+from deepks.utils import load_basis, get_shell_sec
 from deepks.model.model import CorrNet
 from deepks.scf.penalty import PenaltyMixin
 
@@ -48,12 +50,35 @@ def t_get_corr(model, dm, ovlp_shells, with_vc=True):
     """return the "correction" energy (and potential) given by a NN model"""
     dm.requires_grad_(True)
     ceig = t_make_eig(dm, ovlp_shells) # natoms x nproj
-    _dref = next(model.parameters())
+    _dref = next(model.parameters()) if isinstance(model, nn.Module) else DEVICE
     ec = model(ceig.to(_dref))  # no batch dim here, unsqueeze(0) if needed
     if not with_vc:
         return ec.to(ceig)
     [vc] = torch.autograd.grad(ec, dm, torch.ones_like(ec))
     return ec.to(ceig), vc
+
+
+def t_batch_jacobian(f, x, noutputs):
+    nindim = len(x.shape)-1
+    x = x.unsqueeze(1) # b, 1 ,*in_dim
+    n = x.shape[0]
+    x = x.repeat(1, noutputs, *[1]*nindim) # b, out_dim, *in_dim
+    x.requires_grad_(True)
+    y = f(x)
+    input_val = torch.eye(noutputs).reshape(1,noutputs, noutputs).repeat(n, 1, 1)
+    return torch.autograd.grad(y, x, input_val)[0]
+
+
+def t_make_grad_eig_dm(dm, ovlp_shells):
+    """return jacobian of decriptor eigenvalues w.r.t 1-rdm"""
+    # using the sparsity, much faster than naive torch version
+    # v stands for eigen values
+    pdm_shells = [dm.requires_grad_(True) for dm in t_make_pdm(dm, ovlp_shells)]
+    gvdm_shells = [t_batch_jacobian(t_shell_eig, dm, dm.shape[-1]) 
+                        for dm in pdm_shells]
+    vjac_shells = [torch.einsum('rap,avpq,saq->avrs', po, gdm, po)
+                        for po, gdm in zip(ovlp_shells, gvdm_shells)]
+    return torch.cat(vjac_shells, dim=1)
 
 
 def gen_proj_mol(mol, basis) :
@@ -65,33 +90,17 @@ def gen_proj_mol(mol, basis) :
     return test_mol
 
 
-_zeta = 1.5**np.array([17,13,10,7,5,3,2,1,0,-1,-2,-3])
-_coef = np.diag(np.ones(_zeta.size)) - np.diag(np.ones(_zeta.size-1), k=1)
-_table = np.concatenate([_zeta.reshape(-1,1), _coef], axis=1)
-DEFAULT_BASIS = [[0, *_table.tolist()], [1, *_table.tolist()], [2, *_table.tolist()]]
-
-def load_basis(basis):
-    if basis is None:
-        return DEFAULT_BASIS
-    elif isinstance(basis, np.ndarray) and basis.ndim == 2:
-        return [[ll, *basis.tolist()] for ll in range(3)]
-    elif not isinstance(basis, str):
-        return basis
-    elif basis.endswith(".npy"):
-        table = np.load(basis)
-        return [[ll, *table.tolist()] for ll in range(3)]
-    elif basis.endswith(".npz"):
-        all_tables = np.load(basis).values()
-        return [[ll, *table.tolist()] for ll, table in enumerate(all_tables)]
-    else:
-        return gto.basis.load(basis, symb="Ne")
-
-
 class CorrMixin(abc.ABC):
     """Abstruct mixin class to add "correction" term to the mean-field Hamiltionian"""
 
     def get_veff0(self, *args, **kwargs):
         return super().get_veff(*args, **kwargs)
+    
+    def get_grad0(self, mo_coeff=None, mo_occ=None):
+        if mo_occ is None: mo_occ = self.mo_occ
+        if mo_coeff is None: mo_coeff = self.mo_coeff
+        return super().get_grad(mo_coeff, mo_occ, 
+                                fock=self.get_fock(vhf=self.get_veff0()))
 
     def energy_elec0(self, dm=None, h1e=None, vhf=None):
         if vhf is None: vhf = self.get_veff0(dm=dm)
@@ -109,7 +118,7 @@ class CorrMixin(abc.ABC):
             mol = self.mol
         if dm is None: 
             dm = self.make_rdm1()
-        tic = (time.clock(), time.time())
+        tic = (time.process_time(), time.perf_counter())
         # base method part
         v0_last = getattr(vhf_last, 'v0', 0)
         v0 = self.get_veff0(mol, dm, dm_last, v0_last, hermi)
@@ -153,21 +162,19 @@ class NetMixin(CorrMixin):
     def __init__(self, model, proj_basis=None, device=DEVICE):
         # make sure you call this method after the base SCF class init
         # otherwise it would throw an error due to the lack of mol attr
-        rawmodel = model
         self.device = device
         if isinstance(model, str):
             model = CorrNet.load(model).double()
         if isinstance(model, torch.nn.Module):
-            model = model.to(self.device)
+            model = model.to(self.device).eval()
         self.net = model
         # try load basis from model file
-        if proj_basis is None and isinstance(rawmodel, str):
-            mdict = torch.load(rawmodel, map_location="cpu")
-            proj_basis = mdict.get("extra_info", {}).get("proj_basis", None)
+        if proj_basis is None:
+            proj_basis = getattr(model, "_pbas", None)
         # should be a list here, follow pyscf convention
         self._pbas = load_basis(proj_basis)
         # [1,1,1,...,3,3,3,...,5,5,5,...]
-        self._shell_sec = sum(([2*b[0]+1] * (len(b)-1) for b in self._pbas), [])
+        self._shell_sec = get_shell_sec(self._pbas)
         # total number of projected basis per atom
         self.nproj = sum(self._shell_sec)
         # prepare overlap integrals used in projection
@@ -241,12 +248,11 @@ class NetMixin(CorrMixin):
         # return shape [nao x natom x nproj]
         return proj.reshape(nao, natm, pnao // natm)
 
-    def save_model(self, filename, with_basis=True):
-        extra_info = {}
-        if with_basis:
-            extra_info["proj_basis"] = self._pbas
-        self.net.save(filename, **extra_info)
-
+    # additional methods for dm training impl'd in addons
+    # from deepks.scf.addons import make_grad_eig_egrad
+    # from deepks.scf.addons import make_grad_coul_veig
+    # from deepks.scf.addons import calc_optim_veig
+        
 
 class DSCF(NetMixin, PenaltyMixin, dft.rks.RKS):
     """Restricted SCF solver for given NN energy model"""

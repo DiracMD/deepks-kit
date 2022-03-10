@@ -6,7 +6,7 @@ from pyscf import gto, scf, lib
 from pyscf.lib import logger
 from pyscf.grad import rks as rks_grad
 from pyscf.grad import uks as uks_grad
-from deepks.scf.scf import t_make_pdm, t_shell_eig
+from deepks.scf.scf import t_make_pdm, t_shell_eig, t_batch_jacobian
 
 # see ./_old_grad.py for a more clear (but maybe slower) implementation
 # all variables and functions start with "t_" are torch related.
@@ -91,17 +91,6 @@ def t_grad_corr(mol, model, dm, ovlp_shells, ipov_shells, atmlst=None):
     return dec
 
 
-def t_batch_jacobian(f, x, noutputs):
-    nindim = len(x.shape)-1
-    x = x.unsqueeze(1) # b, 1 ,*in_dim
-    n = x.shape[0]
-    x = x.repeat(1, noutputs, *[1]*nindim) # b, out_dim, *in_dim
-    x.requires_grad_(True)
-    y = f(x)
-    input_val = torch.eye(noutputs).reshape(1,noutputs, noutputs).repeat(n, 1, 1)
-    return torch.autograd.grad(y, x, input_val)[0]
-
-
 class CorrGradMixin(abc.ABC):
 
     def __init__(self, *args, **kwargs):
@@ -110,7 +99,7 @@ class CorrGradMixin(abc.ABC):
 
     def grad_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         de = super().grad_elec(mo_energy, mo_coeff, mo_occ, atmlst)
-        cput0 = (time.clock(), time.time())
+        cput0 = (time.process_time(), time.perf_counter())
         dec = self.grad_corr(self.base.make_rdm1(mo_coeff, mo_occ), atmlst)
         logger.timer(self, 'gradients of NN pulay part', *cput0)
         # memeorize the result to save time in get_base
@@ -214,6 +203,9 @@ class NetGradMixin(CorrGradMixin):
         # hecking the old scanner's method, bind the new one
         scanner.__class__ = NewScanner
         return scanner
+
+    # additional methods for dm training impl'd in addons
+    # from deepks.scf.addons import gcalc_optim_veig as calc_optim_veig
 
 
 def build_grad(mf):
