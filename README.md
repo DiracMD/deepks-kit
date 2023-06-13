@@ -53,10 +53,8 @@ Check [this input file](./examples/water_cluster/args.yaml) for detailed explana
 [2] Chen, Y., Zhang, L., Wang, H. and E, W., 2021. DeePKS: A Comprehensive Data-Driven Approach toward Chemically Accurate Density Functional Theory. Journal of Chemical Theory and Computation, 17(1), pp.170–181.
 
 
-<!-- ## TODO
-
-- [ ] Print loss separately for E and F in training.
-- [ ] Rewrite all `print` function using `logging`.
-- [ ] Write a detailed README and more docs.
-- [ ] Add unit tests. -->
-
+## Todo know th code
+[ ] to build the descriptor
+[ ] to combine the workflow and training efficiency
+[ ] combine a semi-empircal method 
+[ ] deal with complex system
